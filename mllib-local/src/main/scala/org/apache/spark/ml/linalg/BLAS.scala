@@ -17,29 +17,43 @@
 
 package org.apache.spark.ml.linalg
 
+import java.lang.ClassNotFoundException
+
 import com.github.fommil.netlib.{BLAS => NetlibBLAS, F2jBLAS}
-import com.github.fommil.netlib.BLAS.{getInstance => NativeBLAS}
 
 /**
  * BLAS routines for MLlib's vectors and matrices.
  */
 private[spark] object BLAS extends Serializable {
 
-  @transient private var _f2jBLAS: NetlibBLAS = _
+  @transient private var _javaBLAS: NetlibBLAS = _
   @transient private var _nativeBLAS: NetlibBLAS = _
   private val nativeL1Threshold: Int = 256
 
-  // For level-1 function dspmv, use f2jBLAS for better performance.
-  private[ml] def f2jBLAS: NetlibBLAS = {
-    if (_f2jBLAS == null) {
-      _f2jBLAS = new F2jBLAS
+  // For level-1 function dspmv, use javaBLAS for better performance.
+  private[ml] def javaBLAS: NetlibBLAS = {
+    if (_javaBLAS == null) {
+      try {
+        _javaBLAS = new VectorBLAS
+      } catch {
+        case e: ClassNotFoundException =>
+          _javaBLAS = new F2jBLAS
+      }
     }
-    _f2jBLAS
+    _javaBLAS
+  }
+
+  // For level-3 routines, we use the native BLAS.
+  private[ml] def nativeBLAS: NetlibBLAS = {
+    if (_nativeBLAS == null) {
+      _nativeBLAS = NetlibBLAS.getInstance
+    }
+    _nativeBLAS
   }
 
   private[ml] def getBLAS(vectorSize: Int): NetlibBLAS = {
-    if (vectorSize < nativeL1Threshold) {
-      f2jBLAS
+    if (vectorSize < nativeL1Threshold || NetlibBLAS.getInstance.isInstanceOf[F2jBLAS]) {
+      javaBLAS
     } else {
       nativeBLAS
     }
@@ -235,14 +249,6 @@ private[spark] object BLAS extends Serializable {
     }
   }
 
-  // For level-3 routines, we use the native BLAS.
-  private[ml] def nativeBLAS: NetlibBLAS = {
-    if (_nativeBLAS == null) {
-      _nativeBLAS = NativeBLAS
-    }
-    _nativeBLAS
-  }
-
   /**
    * Adds alpha * x * x.t to a matrix in-place. This is the same as BLAS's ?SPR.
    *
@@ -267,7 +273,7 @@ private[spark] object BLAS extends Serializable {
       x: DenseVector,
       beta: Double,
       y: DenseVector): Unit = {
-    f2jBLAS.dspmv("U", n, alpha, A.values, x.values, 1, beta, y.values, 1)
+    javaBLAS.dspmv("U", n, alpha, A.values, x.values, 1, beta, y.values, 1)
   }
 
   /**
@@ -279,7 +285,7 @@ private[spark] object BLAS extends Serializable {
     val n = v.size
     v match {
       case DenseVector(values) =>
-        NativeBLAS.dspr("U", n, alpha, values, 1, U)
+        nativeBLAS.dspr("U", n, alpha, values, 1, U)
       case SparseVector(size, indices, values) =>
         val nnz = indices.length
         var colStartIdx = 0
@@ -749,6 +755,284 @@ private[spark] object BLAS extends Serializable {
         }
         colCounterForA += 1
       }
+    }
+  }
+}
+
+final private class VectorBLAS extends F2jBLAS {
+  import jdk.incubator.vector.{DoubleVector => JDoubleVector}
+  import jdk.incubator.vector.{FloatVector => JFloatVector}
+  import jdk.incubator.vector.{VectorOperators => JVectorOperators}
+
+  val FMAX = JFloatVector.SPECIES_MAX
+  val DMAX = JDoubleVector.SPECIES_MAX
+
+  println("-------------------- Hello from VectorBLAS --------------------") // scalastyle:ignore
+
+  // y += a * x
+  override def daxpy(
+      n: Int,
+      da: Double,
+      x: Array[Double],
+      incx: Int,
+      y: Array[Double],
+      incy: Int): Unit = {
+    if (incx == 1 && incy == 1) {
+      var i = 0
+      val upperBound = DMAX.loopBound(n)
+      while (i < upperBound) {
+        val vx = JDoubleVector.fromArray(DMAX, x, i)
+        val vy = JDoubleVector.fromArray(DMAX, y, i)
+        vx.lanewise(JVectorOperators.MUL, da).add(vy)
+          .intoArray(y, i)
+        i += DMAX.length()
+      }
+      while (i < n) {
+        y(i) += da * x(i)
+        i += 1
+      }
+    } else {
+      super.daxpy(n, da, x, incx, y, incy)
+    }
+  }
+
+  // sum(x * y)
+  override def sdot(
+      n: Int,
+      x: Array[Float],
+      incx: Int,
+      y: Array[Float],
+      incy: Int): Float = {
+    if (incx == 1 && incy == 1) {
+      var sum: Float = 0.0f
+      var i = 0
+      val upperBound = FMAX.loopBound(n)
+      while (i < upperBound) {
+        val vx = JFloatVector.fromArray(FMAX, x, i)
+        val vy = JFloatVector.fromArray(FMAX, y, i)
+        sum += vx.mul(vy).reduceLanes(JVectorOperators.ADD)
+        i += FMAX.length()
+      }
+      while (i < n) {
+        sum += x(i) * y(i)
+        i += 1
+      }
+
+      sum
+    } else {
+      super.sdot(n, x, incx, y, incy)
+    }
+  }
+
+  // sum(x * y)
+  override def ddot(
+      n: Int,
+      x: Array[Double],
+      incx: Int,
+      y: Array[Double],
+      incy: Int): Double = {
+    if (incx == 1 && incy == 1) {
+      var sum: Double = 0.0
+      var i = 0
+      val upperBound = DMAX.loopBound(n)
+      while (i < upperBound) {
+        val vx = JDoubleVector.fromArray(DMAX, x, i)
+        val vy = JDoubleVector.fromArray(DMAX, y, i)
+        sum += vx.mul(vy).reduceLanes(JVectorOperators.ADD)
+        i += DMAX.length()
+      }
+      while (i < n) {
+        sum += x(i) * y(i)
+        i += 1
+      }
+
+      sum
+    } else {
+      super.ddot(n, x, incx, y, incy)
+    }
+  }
+
+  // x = a * x
+  override def dscal(
+      n: Int,
+      da: Double,
+      x: Array[Double],
+      incx: Int): Unit = {
+    if (incx == 1) {
+      var i = 0
+      val upperBound = DMAX.loopBound(n)
+      while (i < upperBound) {
+        val vx = JDoubleVector.fromArray(DMAX, x, i)
+        vx.lanewise(JVectorOperators.MUL, da)
+          .intoArray(x, i)
+        i += DMAX.length()
+      }
+      while (i < n) {
+        x(i) *= da
+        i += 1
+      }
+    } else {
+      super.dscal(n, da, x, incx)
+    }
+  }
+
+  // y := alpha * a * x + beta * y
+  override def dspmv(
+      uplo: String,
+      n: Int,
+      alpha: Double,
+      a: Array[Double],
+      x: Array[Double],
+      incx: Int,
+      beta: Double,
+      y: Array[Double],
+      incy: Int): Unit = {
+    if (uplo == "U" && incx == 1 && incy == 1) {
+      var offset = 0
+      var c = 0
+      while (c < n) {
+        var aTx = 0.0 // A * x
+        var r = 0
+        val upperBound = DMAX.loopBound(n - c)
+        while (r < upperBound) {
+          val vx = JDoubleVector.fromArray(DMAX, x, r)
+          val va = JDoubleVector.fromArray(DMAX, a, r + offset)
+          aTx += vx.mul(va).reduceLanes(JVectorOperators.ADD)
+          offset += DMAX.length()
+          r += DMAX.length()
+        }
+        while (r < n - c) {
+          aTx += x(r) * a(r + offset)
+          offset += 1
+          r += 1
+        }
+        y(c) = alpha * aTx + beta * y(c)
+        c += 1
+      }
+    } else {
+      super.dspmv(uplo, n, alpha, a, x, incx, beta, y, incy)
+    }
+  }
+
+  // a += alpha * x * x.t
+  override def dspr(
+      uplo: String,
+      n: Int,
+      alpha: Double,
+      x: Array[Double],
+      incx: Int,
+      a: Array[Double]): Unit = {
+    if (uplo == "U" && incx == 1) {
+      var offset = 0
+      var c = 0;
+      while (c < n) {
+        var r = 0;
+        val upperBound = DMAX.loopBound(n - c)
+        while (r < upperBound) {
+          val vx = JDoubleVector.fromArray(DMAX, x, r)
+          val va = JDoubleVector.fromArray(DMAX, a, r + offset)
+          vx.lanewise(JVectorOperators.MUL, alpha * x(c)).add(va)
+            .intoArray(a, r + offset)
+          offset += DMAX.length()
+          r += DMAX.length()
+        }
+        while (r < n - c) {
+          a(r + offset) += alpha * x(c) * x(r)
+          offset += 1
+          r += 1
+        }
+        c += 1
+      }
+    } else {
+      super.dspr(uplo, n, alpha, x, incx, a)
+    }
+  }
+
+  // a += alpha * x * x.t
+  override def dsyr(
+      uplo: String,
+      n: Int,
+      alpha: Double,
+      x: Array[Double],
+      incx: Int,
+      a: Array[Double],
+      lda: Int): Unit = {
+    if (uplo == "U" && incx == 1) {
+      var c = 0
+      while (c < n) {
+        val offset = c * n
+        var r = 0
+        val upperBound = DMAX.loopBound(n - c)
+        while (r < upperBound) {
+          val vx = JDoubleVector.fromArray(DMAX, x, r)
+          val va = JDoubleVector.fromArray(DMAX, a, r + offset)
+          vx.lanewise(JVectorOperators.MUL, alpha * x(c)).add(va)
+            .intoArray(a, r + offset)
+          r += DMAX.length()
+        }
+        while (r < n - c) {
+          a(r + offset) += alpha * x(c) * x(r)
+          r += 1
+        }
+        c += 1
+      }
+    } else {
+      super.dsyr(uplo, n, alpha, x, incx, a, lda)
+    }
+  }
+
+  override def dgemm( // scalastyle:ignore
+      transa: String,
+      transb: String,
+      m: Int,
+      n: Int,
+      k: Int,
+      alpha: Double,
+      a: Array[Double],
+      lda: Int,
+      b: Array[Double],
+      ldb: Int,
+      beta: Double,
+      c: Array[Double],
+      ldc: Int): Unit = {
+    super.dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
+  }
+
+  // y = alpha * a * x + beta * y
+  override def dgemv( // scalastyle:ignore
+      trans: String,
+      m: Int,
+      n: Int,
+      alpha: Double,
+      a: Array[Double],
+      lda: Int,
+      x: Array[Double],
+      incx: Int,
+      beta: Double,
+      y: Array[Double],
+      incy: Int): Unit = {
+    if (trans == "T" && incx == 1 && incy == 1) {
+      var c = 0
+      while (c < n) {
+        val offset = c * n
+        var aTx = 0.0 // A * x
+        var r = 0
+        val upperBound = DMAX.loopBound(m)
+        while (r < upperBound) {
+          val vx = JDoubleVector.fromArray(DMAX, x, r)
+          val va = JDoubleVector.fromArray(DMAX, a, r + offset)
+          aTx += vx.mul(va).reduceLanes(JVectorOperators.ADD)
+          r += DMAX.length()
+        }
+        while (r < m) {
+          aTx += x(r) * a(r + offset)
+          r += 1
+        }
+        y(c) = alpha * aTx + beta * y(c)
+        c += 1
+      }
+    } else {
+      super.dgemv(trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
     }
   }
 }

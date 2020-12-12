@@ -306,7 +306,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       srcIter.foreach { case (srcId, srcFactor) =>
         dstIter.foreach { case (dstId, dstFactor) =>
           // We use F2jBLAS which is faster than a call to native BLAS for vector dot product
-          val score = BLAS.f2jBLAS.ddot(rank, srcFactor, 1, dstFactor, 1)
+          val score = BLAS.javaBLAS.ddot(rank, srcFactor, dstFactor)
           pq += dstId -> score
         }
         pq.foreach { case (dstId, score) =>
