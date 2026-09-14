@@ -42,7 +42,7 @@ on:
         type: string
         default: ubuntu-latest
       arch:
-        description: The target architecture (x86, x64, arm64) of the Python interpreter.
+        description: The target architecture (x86, x64, arm64, riscv64) of the Python interpreter.
         required: false
         type: string
         default: x64
@@ -101,7 +101,7 @@ jobs:
       - name: Install Java ${{ inputs.java }}
         uses: actions/setup-java@v6
         with:
-          distribution: zulu
+          distribution: ${{ case(inputs.arch == 'riscv64', 'temurin', 'zulu') }}
           java-version: ${{ inputs.java }}
       - name: Build Spark with Maven
         shell: |
@@ -245,7 +245,7 @@ jobs:
       - name: Install Java ${{ matrix.java }}
         uses: actions/setup-java@v6
         with:
-          distribution: zulu
+          distribution: ${{ case(inputs.arch == 'riscv64', 'temurin', 'zulu') }}
           java-version: ${{ matrix.java }}
       - name: Install Python 3.12
         uses: actions/setup-python@v7
